@@ -23,9 +23,6 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write # 同步需要向本仓推送
-
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
@@ -39,6 +36,8 @@ jobs:
     name: Sync upstream
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write # 同步需要向本仓推送（仅此 job 需要；build job 跑上游构建脚本，保持只读）
     outputs:
       changed: ${{ steps.merge.outputs.changed }}
       head_sha: ${{ steps.merge.outputs.head_sha }}
