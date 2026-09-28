@@ -1,0 +1,137 @@
+name: Sync Upstream & Build
+
+# 每天把上游（3304711297/workbuddy2api）的 main 同步进本 fork：
+#   有变更 → 合并推送，随后编译 Tauri release 产物并上传 artifact
+#   无变更 → 直接退出，不编译
+#
+# 编译为什么不交给 ci.yml：用 GITHUB_TOKEN 推送的提交不会触发其它 workflow
+# （GitHub 的防递归机制），push 完 CI 不会自己跑，所以编译必须留在本 workflow 内。
+#
+# 为什么用 merge，而不是 --ff-only / reset --hard：
+# 本 fork 的 main 上多一个上游没有的文件（本 workflow 自身），main 因此永远领先上游，
+# --ff-only 必然失败；而 reset --hard / force push 会抹掉本地提交，并让已克隆本仓的
+# 用户再也无法靠 `git merge --ff-only` 更新（见 AGENTS.md 第 4 节的更新机制）。
+# 合并冲突时中止且不推送，交由人工处理。
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # UTC 01:00 = 北京时间 09:00
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 上游无变更时也强制编译一次（用于验证构建链路）
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # 同步需要向本仓推送
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/3304711297/workbuddy2api.git
+  SYNC_BRANCH: main
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      head_sha: ${{ steps.merge.outputs.head_sha }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0 # merge 需要共同祖先，浅克隆不行
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "${UPSTREAM_URL}"
+          git fetch --no-tags upstream "${SYNC_BRANCH}"
+
+          before=$(git rev-parse HEAD)
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "fork main: ${before}"
+          echo "upstream:  ${upstream}"
+
+          if git merge-base --is-ancestor "${upstream}" HEAD; then
+            echo "上游无新提交，跳过编译"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${before}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit "upstream/${SYNC_BRANCH}"; then
+            git merge --abort || true
+            echo "::error::上游合并冲突，已中止且未推送，请人工处理"
+            exit 1
+          fi
+
+          head=$(git rev-parse HEAD)
+          git push origin "HEAD:${SYNC_BRANCH}"
+          echo "已同步上游，新 tip: ${head}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (Windows)
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.force_build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout synced commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # beforeBuildCommand 会自动跑 vite build，无需单独构建前端
+      - name: Build Tauri release
+        run: npm run tauri -- build --no-bundle
+
+      # 构建日志说成功不算数：plain cargo 会静默产出无前端的空壳 exe，
+      # 故按 AGENTS.md 第 2 节的口径校验产物本身。
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/release/workbuddy2api.exe"
+          $blob = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($exe))
+          $sha = (git rev-parse HEAD).Trim()
+          $assets = @(Get-ChildItem dist/assets/*.js | ForEach-Object Name)
+          $missing = @($assets | Where-Object { -not $blob.Contains($_) })
+          Write-Host "size=$((Get-Item $exe).Length) bytes; baked_sha=$($blob.Contains($sha)); assets=$($assets.Count); missing=$($missing -join ',')"
+          if (-not $blob.Contains($sha)) { throw "产物未包含本次提交 sha $sha" }
+          if ($missing.Count -gt 0) { throw "产物缺少前端资源 $($missing -join ',')，疑似无前端的空壳 exe" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy2api-${{ needs.sync.outputs.head_sha }}
+          path: src-tauri/target/release/workbuddy2api.exe
+          if-no-files-found: error
+          retention-days: 30
