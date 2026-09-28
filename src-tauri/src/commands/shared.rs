@@ -55,6 +55,30 @@ pub(super) fn upstream_client(timeout_secs: u64) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// 上游出口基址：国内站（copilot.tencent.com）与国际版（www.workbuddy.ai）。
+///
+/// 实测（2026-09-28）：同一枚国际版 token 打 copilot.tencent.com 会被边缘 nginx
+/// 直接 401（非业务报文），打 www.workbuddy.ai 才 200；反之国内 token 打国际站同样不通。
+/// 故凡带账号凭据的上游请求都必须按账号区域选基址。
+pub(super) const UPSTREAM_BASE_CN: &str = "https://copilot.tencent.com";
+pub(super) const UPSTREAM_BASE_INTL: &str = "https://www.workbuddy.ai";
+
+/// 按账号凭据选上游出口基址：显式 `realm == "global"` 优先，缺 realm 时回退
+/// `domain` 是否落在 workbuddy.ai 家族；两者都缺 → 国内站（老凭据零回归）。
+///
+/// 口径与 converter.py 的 `_backend_for_auth` 及 linguo2625469/workbuddy2api-panel 的
+/// `auth.Realm()` 一致。
+pub(super) fn upstream_base_for(auth: &serde_json::Value) -> &'static str {
+    let realm = auth.get("realm").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
+    if !realm.is_empty() {
+        return if realm == "global" { UPSTREAM_BASE_INTL } else { UPSTREAM_BASE_CN };
+    }
+    match auth.get("domain").and_then(|v| v.as_str()) {
+        Some(d) if d.to_ascii_lowercase().contains("workbuddy.ai") => UPSTREAM_BASE_INTL,
+        _ => UPSTREAM_BASE_CN,
+    }
+}
+
 /// %LOCALAPPDATA%（优先环境变量；缺省时从 USERPROFILE 派生；最终回退系统已知目录，不再硬编码用户目录）
 pub(crate) fn local_appdata() -> PathBuf {
     if let Some(v) = env_nonempty("LOCALAPPDATA") {
@@ -205,6 +229,19 @@ pub(super) fn save_accounts_state(st: &AccountsState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_base_follows_realm_then_domain() {
+        // 显式 realm 优先
+        assert_eq!(upstream_base_for(&serde_json::json!({"realm": "global"})), UPSTREAM_BASE_INTL);
+        assert_eq!(upstream_base_for(&serde_json::json!({"realm": "cn", "domain": "www.workbuddy.ai"})), UPSTREAM_BASE_CN);
+        // 缺 realm 回退 domain（含大小写与裸域）
+        assert_eq!(upstream_base_for(&serde_json::json!({"domain": "www.workbuddy.ai"})), UPSTREAM_BASE_INTL);
+        assert_eq!(upstream_base_for(&serde_json::json!({"domain": "workbuddy.ai"})), UPSTREAM_BASE_INTL);
+        assert_eq!(upstream_base_for(&serde_json::json!({"domain": "www.codebuddy.cn"})), UPSTREAM_BASE_CN);
+        // 两者都缺 → 国内站（老凭据零回归）
+        assert_eq!(upstream_base_for(&serde_json::json!({})), UPSTREAM_BASE_CN);
+    }
 
     #[test]
     fn test_atomic_write_file_normal() {
